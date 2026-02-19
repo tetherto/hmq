@@ -5,11 +5,13 @@ const Autobee = require('autobee')
 const ReadyResource = require('ready-resource')
 const Hyperswarm = require('hyperswarm')
 const ID = require('hypercore-id-encoding')
-const Protomux = require('protomux')
 const b4a = require('b4a')
-const c = require('compact-encoding')
 const enc = require('./lib/encoding.js')
-const { isObject, sortByDistance } = require('./lib/utils.js')
+const { isObject } = require('./lib/utils.js')
+const setupHandshake = require('./lib/handshake.js')
+const PubSub = require('./lib/pub-sub.js')
+const WorkQueue = require('./lib/work-queue.js')
+const AckManager = require('./lib/ack-manager.js')
 
 const VIEW_PREFIX = b4a.from('msg!')
 
@@ -33,25 +35,14 @@ class HyperMQ extends ReadyResource {
     this._producer = !!opts.producer
     this._concurrent = opts.concurrent || 0
     this._timeout = opts.timeout || 5000
-
-    this._subs = new Map()
-    this._resolvers = new Map()
-    this._wildcards = []
-    this._orphans = new Map()
     this._maxOrphans = opts.maxOrphanAcks || 10000
-    this._pending = []
-    this._scheduled = false
-    this._processing = false
+
     this._discovery = null
     this._ownSwarm = !opts.swarm
 
-    this._consumers = new Map()
-    this._busy = 0
-    this._msgRejections = new Map()
-    this._msgAckCount = new Map()
-    this._pendingClaims = new Map()
-    this._deferred = new Map()
-    this._registered = false
+    this.pubSub = new PubSub(this)
+    this.workQueue = new WorkQueue(this)
+    this.ackManager = new AckManager(this)
 
     this.autobee = new Autobee(corestore, key, {
       apply: this._apply.bind(this),
@@ -67,6 +58,9 @@ class HyperMQ extends ReadyResource {
 
   async _open () {
     await this.autobee.ready()
+    await this.pubSub.ready()
+    await this.workQueue.ready()
+    await this.ackManager.ready()
 
     this.key = this.autobee.key
     this.discoveryKey = this.autobee.discoveryKey
@@ -81,13 +75,13 @@ class HyperMQ extends ReadyResource {
     this._discovery = this.swarm.join(this.discoveryKey)
     await this._discovery.flushed()
 
-    if (!this._producer && !this._registered) {
+    if (!this._producer && !this.workQueue.registered) {
       if (!this.writable) {
         await new Promise(resolve => this.autobee.once('writable', resolve))
       }
       try {
         await this.autobee.append(enc.encodeRegisterConsumer(this._publicKey))
-        this._registered = true
+        this.workQueue.registered = true
       } catch (err) {
         this._emitWarning(new Error('Failed to register consumer', { cause: err }))
       }
@@ -97,25 +91,10 @@ class HyperMQ extends ReadyResource {
   async _close () {
     if (this._discovery) await this.swarm.leave(this.discoveryKey)
     if (this._ownSwarm) await this.swarm.destroy()
-    this._subs.clear()
-    this._pending.length = 0
-    this._scheduled = false
-    this._processing = false
-    this._orphans.clear()
-    for (const list of this._resolvers.values()) {
-      for (const resolve of list) resolve(null)
-    }
-    this._resolvers.clear()
-    for (const resolve of this._wildcards) resolve(null)
-    this._wildcards = []
-
-    for (const claim of this._pendingClaims.values()) clearTimeout(claim.timer)
-    this._pendingClaims.clear()
-    this._consumers.clear()
-    this._msgRejections.clear()
-    this._msgAckCount.clear()
-    this._deferred.clear()
-    this._busy = 0
+    
+    await this.pubSub.close()
+    await this.workQueue.close()
+    await this.ackManager.close()
 
     await this.autobee.close()
   }
@@ -146,10 +125,10 @@ class HyperMQ extends ReadyResource {
           await this._applyAck(entry, view, w)
           break
         case enc.TYPE_REJ:
-          this._applyRej(entry)
+          this.workQueue.onRej(entry)
           break
         case enc.TYPE_REGISTER_CONSUMER:
-          this._applyRegisterConsumer(entry)
+          this.workQueue.onRegisterConsumer(entry)
           break
       }
     }
@@ -174,8 +153,8 @@ class HyperMQ extends ReadyResource {
     if (hex === null) return
 
     const viewKey = this._viewKey(entry.key)
-    const orphanAck = this._orphans.get(hex) || null
-    if (orphanAck) this._orphans.delete(hex)
+    const orphanAck = this.ackManager.getOrphan(hex) || null
+    if (orphanAck) this.ackManager.removeOrphan(hex)
 
     const record = enc.encodeViewRecord({
       topic: entry.topic,
@@ -192,21 +171,12 @@ class HyperMQ extends ReadyResource {
     const msg = { topic: entry.topic, data: entry.data, key: entry.key, concurrent }
 
     if (concurrent > 0 && !this._producer) {
-      this._handleWorkQueueMessage(msg)
+      this.workQueue.onMessage(msg)
       return
     }
 
     const isLocal = b4a.equals(node.key, this.autobee.local.key)
-    const subs = this._subs.get(entry.topic)
-
-    if (subs && subs.size > 0) {
-      if (isLocal) {
-        this._invokeSubscribers(subs, msg)
-      } else {
-        this._pending.push(msg)
-        this._scheduleDelivery()
-      }
-    }
+    this.pubSub.onMessage(msg, isLocal)
   }
 
   async _applyAck (entry, view, w) {
@@ -229,69 +199,10 @@ class HyperMQ extends ReadyResource {
     }
 
     if (!persisted) {
-      this._orphans.set(hex, entry.ack)
-      if (this._orphans.size > this._maxOrphans) {
-        const oldest = this._orphans.keys().next().value
-        this._orphans.delete(oldest)
-        this._emitWarning(new Error('Orphan ack evicted, cap reached'))
-      }
+      this.ackManager.addOrphan(hex, entry.ack)
     }
 
-    const count = (this._msgAckCount.get(hex) || 0) + 1
-    this._msgAckCount.set(hex, count)
-    this._evaluateClaims(hex)
-
-    this._resolveAcks(entry.key, entry.ack)
-  }
-
-  _scheduleDelivery () {
-    if (this._scheduled || this._processing) return
-    this._scheduled = true
-    setImmediate(() => {
-      this._scheduled = false
-      this._processDeliveries().catch((err) => {
-        this._emitWarning(new Error('Delivery processor failed', { cause: err }))
-      })
-    })
-  }
-
-  async _processDeliveries () {
-    if (this._processing) return
-    this._processing = true
-
-    try {
-      while (this._pending.length > 0) {
-        const batch = this._pending
-        this._pending = []
-
-        for (const msg of batch) {
-          if (this.writable && !(msg.concurrent > 0)) {
-            this._appendAck(msg.key)
-          }
-
-          const subs = this._subs.get(msg.topic)
-          if (subs) {
-            this._invokeSubscribers(subs, msg)
-          }
-        }
-      }
-    } finally {
-      this._processing = false
-      if (this._pending.length > 0) this._scheduleDelivery()
-    }
-  }
-
-  _resolveAcks (key, ack) {
-    const hex = b4a.toString(key, 'hex')
-    const keyed = this._resolvers.get(hex)
-    if (keyed) {
-      this._resolvers.delete(hex)
-      for (const resolve of keyed) resolve(ack)
-    }
-
-    const wildcards = this._wildcards
-    this._wildcards = []
-    for (const resolve of wildcards) resolve(ack)
+    this.ackManager.onAck(entry)
   }
 
   async publish (topic, data, opts = {}) {
@@ -315,37 +226,16 @@ class HyperMQ extends ReadyResource {
   }
 
   subscribe (topic, cb) {
-    if (typeof cb !== 'function') throw new TypeError('callback must be a function')
-    if (!this._subs.has(topic)) {
-      this._subs.set(topic, new Set())
-    }
-    this._subs.get(topic).add(cb)
+    this.pubSub.subscribe(topic, cb)
   }
 
   unsubscribe (topic, cb) {
-    if (!cb) {
-      this._subs.delete(topic)
-      return
-    }
-    const subs = this._subs.get(topic)
-    if (subs) {
-      subs.delete(cb)
-      if (subs.size === 0) this._subs.delete(topic)
-    }
+    this.pubSub.unsubscribe(topic, cb)
   }
 
   async waitAck (key) {
     if (!this.opened) await this.ready()
-    return new Promise((resolve) => {
-      if (!key) {
-        this._wildcards.push(resolve)
-        return
-      }
-      const hex = b4a.toString(key, 'hex')
-      const list = this._resolvers.get(hex)
-      if (list) list.push(resolve)
-      else this._resolvers.set(hex, [resolve])
-    })
+    return this.ackManager.waitAck(key)
   }
 
   replicate (...args) {
@@ -353,22 +243,7 @@ class HyperMQ extends ReadyResource {
   }
 
   setupHandshake (conn) {
-    const mux = Protomux.from(conn)
-    let req
-
-    const handshake = mux.createChannel({
-      protocol: '@hypermq/handshake',
-      id: b4a.from('hmq!handshake'),
-      onopen: () => { if (!this.writable) req.send(this._publicKey) },
-      onclose: () => {}
-    })
-
-    req = handshake.addMessage({
-      encoding: c.fixed32,
-      onmessage: async (key) => { await this.addWriter(key) }
-    })
-
-    handshake.open()
+    setupHandshake(this, conn)
   }
 
   async flush () {
@@ -388,195 +263,19 @@ class HyperMQ extends ReadyResource {
     await this.autobee.append(enc.encodeRemoveWriter(key))
   }
 
-  _applyRegisterConsumer (entry) {
-    const hex = this._keyHex(entry.key, 'register-consumer entry')
-    if (hex === null) return
-    this._consumers.set(hex, entry.key)
-  }
-
-  _applyRej (entry) {
-    const hex = this._keyHex(entry.key, 'rej entry')
-    if (hex === null) return
-    const consumerHex = this._keyHex(entry.consumer)
-    if (consumerHex === null) return
-
-    let rejSet = this._msgRejections.get(hex)
-    if (!rejSet) {
-      rejSet = new Set()
-      this._msgRejections.set(hex, rejSet)
-    }
-    rejSet.add(consumerHex)
-
-    this._evaluateClaims(hex)
-  }
-
-  _handleWorkQueueMessage (msg) {
-    if (this._producer) return
-
-    const hex = this._keyHex(msg.key)
-    if (hex === null) return
-
-    const subs = this._subs.get(msg.topic)
-    if (!subs || subs.size === 0) return
-
-    if (this._busy > 0) {
-      this._rejectAndDefer(hex, msg)
-      return
-    }
-
-    const sorted = sortByDistance(this._consumers, msg.key)
-    const myIndex = sorted.findIndex((e) => e.hex === this._publicKeyHex)
-
-    if (myIndex < 0) return
-
-    if (myIndex === 0) {
-      this._processClaim(hex, msg)
-      return
-    }
-
-    const closerConsumers = sorted.slice(0, myIndex).map((e) => e.hex)
-    const timer = setTimeout(() => {
-      this._onClaimTimeout(hex)
-    }, myIndex * this._timeout)
-
-    this._pendingClaims.set(hex, { msg, timer, closerConsumers })
-  }
-
-  _rejectAndDefer (hex, msg) {
-    this._deferred.set(hex, msg)
-    if (this.writable) {
-      const rejBuf = enc.encodeRej(msg.key, this._publicKey)
-      this.autobee.append(rejBuf).catch((err) => {
-        this._emitWarning(new Error('Failed to append rej entry', { cause: err }))
-      })
-    }
-  }
-
-  _onClaimTimeout (hex) {
-    const claim = this._pendingClaims.get(hex)
-    if (!claim) return
-    this._pendingClaims.delete(hex)
-    this._processClaim(hex, claim.msg)
-  }
-
-  _evaluateClaims (hex) {
-    const claim = this._pendingClaims.get(hex)
-    if (!claim) {
-      const deferred = this._deferred.get(hex)
-      if (deferred) {
-        const ackCount = this._msgAckCount.get(hex) || 0
-        if (ackCount >= deferred.concurrent) {
-          this._deferred.delete(hex)
-        }
-      }
-      return
-    }
-
-    const ackCount = this._msgAckCount.get(hex) || 0
-    if (ackCount >= claim.msg.concurrent) {
-      clearTimeout(claim.timer)
-      this._pendingClaims.delete(hex)
-      return
-    }
-
-    const rejSet = this._msgRejections.get(hex)
-    if (!rejSet) return
-
-    const allCloserRejected = claim.closerConsumers.every((c) => rejSet.has(c))
-    if (allCloserRejected) {
-      clearTimeout(claim.timer)
-      this._pendingClaims.delete(hex)
-      this._processClaim(hex, claim.msg)
-    }
-  }
-
-  _processClaim (hex, msg) {
-    const ackCount = this._msgAckCount.get(hex) || 0
-    if (ackCount >= msg.concurrent) return
-
-    if (this._busy > 0) {
-      this._rejectAndDefer(hex, msg)
-      return
-    }
-
-    this._deliverAndAck(hex, msg)
-  }
-
-  _deliverAndAck (hex, msg) {
-    this._busy++
-    this._deferred.delete(hex)
-    this._appendAck(msg.key)
-
-    const subs = this._subs.get(msg.topic)
-    const done = () => {
-      this._busy--
-      this._drainDeferred()
-    }
-
-    if (!subs || subs.size === 0) {
-      done()
-      return
-    }
-
-    this._invokeSubscribers(subs, msg).then(done, done)
-  }
-
-  _drainDeferred () {
-    if (this._busy > 0) return
-    if (this._deferred.size === 0) return
-
-    let best = null
-    let bestHex = null
-
-    for (const [hex, msg] of this._deferred) {
-      const ackCount = this._msgAckCount.get(hex) || 0
-      if (ackCount >= msg.concurrent) {
-        this._deferred.delete(hex)
-        continue
-      }
-
-      const sorted = sortByDistance(this._consumers, msg.key)
-      const myIndex = sorted.findIndex((e) => e.hex === this._publicKeyHex)
-      if (myIndex < 0) continue
-
-      if (best === null || myIndex < best) {
-        best = myIndex
-        bestHex = hex
-      }
-    }
-
-    if (bestHex !== null) {
-      const msg = this._deferred.get(bestHex)
-      if (msg) {
-        this._deferred.delete(bestHex)
-        this._handleWorkQueueMessage(msg)
-      }
-    }
-  }
-
-  _invokeSubscribers (subs, msg) {
-    const promises = []
-    for (const cb of subs) {
-      try {
-        const result = cb(msg)
-        if (result && typeof result.then === 'function') {
-          promises.push(result.catch((err) => {
-            this._emitWarning(new Error('Subscriber callback rejected', { cause: err }))
-          }))
-        }
-      } catch (err) {
-        this._emitWarning(new Error('Subscriber callback threw', { cause: err }))
-      }
-    }
-    if (promises.length === 0) return Promise.resolve()
-    return Promise.all(promises)
-  }
-
   _appendAck (key) {
     if (!this.writable) return
     const buf = enc.encodeAck(key, { consumer: this._publicKey })
     this.autobee.append(buf).catch((err) => {
       this._emitWarning(new Error('Failed to append ack', { cause: err }))
+    })
+  }
+
+  _appendRej (key) {
+    if (!this.writable) return
+    const buf = enc.encodeRej(key, this._publicKey)
+    this.autobee.append(buf).catch((err) => {
+      this._emitWarning(new Error('Failed to append rej entry', { cause: err }))
     })
   }
 

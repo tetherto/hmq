@@ -1,15 +1,15 @@
 {
   "name": "hypermq",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "simple MQ backed by autobee",
-  "homepage": "https://github.com/chetasr/hypermq#readme",
+  "homepage": "https://github.com/tetherto/hypermq#readme",
   "bugs": {
-    "url": "https://github.com/chetasr/hypermq/issues"
+    "url": "https://github.com/tetherto/hypermq/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/chetasr/hypermq.git"
+    "url": "git+https://github.com/tetherto/hypermq.git"
   },
   "license": "Apache-2.0",
   "author": "Chetas Murali",

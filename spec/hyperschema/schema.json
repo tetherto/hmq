@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "schema": [
+    {
+      "name": "message",
+      "namespace": "hypermq",
+      "compact": false,
+      "flagsPosition": 4,
+      "fields": [
+        {
+          "name": "topic",
+          "required": true,
+          "type": "string",
+          "version": 1
+        },
+        {
+          "name": "data",
+          "required": true,
+          "type": "buffer",
+          "version": 1
+        },
+        {
+          "name": "timestamp",
+          "required": true,
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "key",
+          "required": true,
+          "type": "fixed32",
+          "version": 1
+        },
+        {
+          "name": "consumer",
+          "type": "fixed32",
+          "version": 1
+        },
+        {
+          "name": "concurrent",
+          "type": "uint",
+          "version": 1
+        },
+        {
+          "name": "state",
+          "type": "buffer",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "action",
+      "namespace": "hypermq",
+      "compact": true,
+      "flagsPosition": -1,
+      "fields": [
+        {
+          "name": "key",
+          "required": true,
+          "type": "fixed32",
+          "version": 1
+        },
+        {
+          "name": "consumer",
+          "required": true,
+          "type": "fixed32",
+          "version": 1
+        }
+      ]
+    },
+    {
+      "name": "register",
+      "namespace": "hypermq",
+      "compact": true,
+      "flagsPosition": 1,
+      "fields": [
+        {
+          "name": "key",
+          "required": true,
+          "type": "fixed32",
+          "version": 1
+        },
+        {
+          "name": "producer",
+          "required": false,
+          "type": "bool",
+          "version": 1
+        }
+      ]
+    }
+  ]
+}

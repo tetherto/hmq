@@ -1,0 +1,5 @@
+test/
+examples/
+reference/
+build.js
+spec/hyperschema/*.schema

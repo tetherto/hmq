@@ -1,0 +1,42 @@
+{
+  "name": "hypermq",
+  "version": "0.2.1",
+  "private": true,
+  "description": "simple MQ backed by autobee",
+  "homepage": "https://github.com/chetasr/hypermq#readme",
+  "bugs": {
+    "url": "https://github.com/chetasr/hypermq/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chetasr/hypermq.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Chetas Murali",
+  "type": "commonjs",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "lib/",
+    "spec/hyperschema/"
+  ],
+  "scripts": {
+    "test": "brittle test/*.js",
+    "build:schema": "node build.js"
+  },
+  "dependencies": {
+    "autobee": "git+https://github.com/holepunchto/autobee.git",
+    "b4a": "^1.6.7",
+    "compact-encoding": "^2.19.0",
+    "hypercore-id-encoding": "^1.3.0",
+    "hyperschema": "^1.20.1",
+    "hyperswarm": "^4.16.0",
+    "protomux": "^3.5.0",
+    "ready-resource": "^1.2.0"
+  },
+  "devDependencies": {
+    "brittle": "^3.7.0",
+    "corestore": "^7.0.0",
+    "test-tmp": "^1.4.0"
+  }
+}

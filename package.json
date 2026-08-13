@@ -1,6 +1,6 @@
 {
   "name": "hypermq",
-  "version": "0.2.1",
+  "version": "2.0.0",
   "private": true,
   "description": "simple MQ backed by autobee",
   "homepage": "https://github.com/chetasr/hypermq#readme",

@@ -1,6 +1,6 @@
 {
   "name": "hmq",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "private": false,
   "description": "simple MQ backed by autobee",
   "homepage": "https://github.com/tetherto/hmq#readme",
